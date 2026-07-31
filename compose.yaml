@@ -1,0 +1,120 @@
+name: docker-server-list
+
+# Three tiers, two networks. web can reach collector; collector can reach
+# socket-proxy; web has no route to socket-proxy at all. That segmentation is
+# what keeps a compromise of the browser-facing process away from the Docker
+# API, where /containers/{id}/archive and Config.Env would otherwise expose
+# every other container's files and secrets.
+
+services:
+  # Read-only gateway in front of the Docker socket. POST is disabled, so even
+  # the collector cannot start, stop, exec or delete anything.
+  # Pinned by digest: this is the only component that touches docker.sock.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2
+    container_name: dsl-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      INFO: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - docker-api
+    # No read_only here: the upstream entrypoint renders haproxy.cfg next to
+    # its own template at startup, and shadowing that directory with a tmpfs
+    # would hide the template. Not worth forking a security-critical config
+    # over, so the rest of the sandbox carries the weight instead.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    pids_limit: 64
+    mem_limit: 64m
+
+  # Talks to Docker, returns only the fields the dashboard renders.
+  collector:
+    build: .
+    image: docker-server-list:local
+    container_name: dsl-collector
+    restart: unless-stopped
+    command: ["node", "src/collector.js"]
+    depends_on:
+      - socket-proxy
+    environment:
+      DOCKER_HOST: tcp://socket-proxy:2375
+      REFRESH_INTERVAL_MS: ${REFRESH_INTERVAL_MS:-5000}
+      HTTP_PROBE: ${HTTP_PROBE:-1}
+      PROBE_TTL_MS: ${PROBE_TTL_MS:-30000}
+      HEALTH_MAX_AGE_MS: ${HEALTH_MAX_AGE_MS:-}
+    # Lets the probe reach ports published on the host (0.0.0.0 bindings).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - docker-api
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 192m
+
+  # Serves the UI. No Docker credentials, no route to socket-proxy.
+  web:
+    build: .
+    image: docker-server-list:local
+    container_name: dsl-web
+    restart: unless-stopped
+    depends_on:
+      - collector
+    environment:
+      COLLECTOR_HOST: collector
+      # Set both to require HTTP Basic auth. Empty = no auth.
+      AUTH_USER: ${AUTH_USER:-}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      # Enable only when a reverse proxy you control sits in front.
+      TRUST_PROXY: ${TRUST_PROXY:-0}
+    # Loopback by default: this dashboard is an inventory of your server and
+    # ships without auth. Widen it deliberately in .env, not by accident.
+    ports:
+      - "${LISTEN_ADDR:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 128m
+
+networks:
+  # web <-> collector
+  internal:
+    driver: bridge
+  # collector <-> socket-proxy. web is deliberately absent.
+  docker-api:
+    driver: bridge

@@ -1,0 +1,146 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Images are digest-pinned, so this weekly run is not about picking up
+    # patches (Dependabot does that) — it catches the stack breaking against a
+    # newer Docker Engine on the runner.
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Pinned to a commit: tags are mutable, and this action runs with write
+      # access to the workspace. Dependabot keeps the pin current.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Syntax check
+        run: |
+          for f in src/server.js src/collector.js src/lib/*.js src/public/app.js; do
+            node --check "$f"
+          done
+
+      - name: Compose config is valid
+        run: docker compose config -q
+
+      - name: No secrets committed
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env must not be committed"; exit 1
+          fi
+
+      - name: Reject invalid numeric configuration
+        run: |
+          docker compose build collector
+          for bad in REFRESH_INTERVAL_MS=abc REFRESH_INTERVAL_MS=-1 PROBE_TIMEOUT_MS=0; do
+            if docker run --rm -e "$bad" -e HTTP_PROBE=0 docker-server-list:local \
+                 timeout 5 node src/collector.js 2>&1 | grep -q '^\[config\]'; then
+              echo "ok: $bad rejected"
+            else
+              echo "::error::$bad was not rejected"; exit 1
+            fi
+          done
+
+      - name: Start stack
+        run: docker compose up -d --build
+
+      - name: Wait for healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          docker compose logs
+          exit 1
+
+      - name: API returns a snapshot
+        run: |
+          curl -fsS http://127.0.0.1:8080/api/containers \
+            | node -e 'const d=JSON.parse(require("fs").readFileSync(0));
+                       if (d.error) { console.error("collect error:", d.error); process.exit(1); }
+                       if (!Array.isArray(d.containers) || d.containers.length === 0) {
+                         console.error("no containers in snapshot"); process.exit(1);
+                       }
+                       console.log("containers:", d.containers.length);'
+
+      # The whole point of the collector tier: secrets must not cross into web.
+      - name: Snapshot carries no container secrets
+        run: |
+          curl -fsS http://127.0.0.1:8080/api/containers > /tmp/snap.json
+          for forbidden in '"Env"' '"Mounts"' '"HostConfig"' '"Binds"' '"Cmd"'; do
+            if grep -qF "$forbidden" /tmp/snap.json; then
+              echo "::error::snapshot leaked $forbidden"; exit 1
+            fi
+          done
+          echo "ok: no Env/Mounts/HostConfig/Binds/Cmd in snapshot"
+
+      # web must have no network path to the Docker API, by name or by address.
+      - name: Web tier cannot reach the Docker API
+        run: |
+          if docker exec dsl-web wget -q -T 5 -O - http://socket-proxy:2375/containers/json 2>/dev/null; then
+            echo "::error::web resolved and reached socket-proxy"; exit 1
+          fi
+          ip=$(docker inspect dsl-socket-proxy \
+                 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+          if docker exec dsl-web wget -q -T 5 -O - "http://$ip:2375/containers/json" 2>/dev/null; then
+            echo "::error::web reached socket-proxy at $ip"; exit 1
+          fi
+          echo "ok: web is isolated from socket-proxy (name and $ip)"
+
+      - name: Mutating Docker API calls are refused
+        run: |
+          id=$(docker ps -q | head -1)
+          probe() {
+            docker run --rm --network docker-server-list_docker-api curlimages/curl:8.11.1 \
+              -s -o /dev/null -w '%{http_code}' "$@"
+          }
+          test "$(probe http://socket-proxy:2375/containers/json)" = "200"
+          test "$(probe -X POST http://socket-proxy:2375/containers/$id/stop)" = "403"
+          test "$(probe -X POST http://socket-proxy:2375/containers/$id/exec)" = "403"
+          test "$(probe -X DELETE http://socket-proxy:2375/containers/$id)" = "403"
+          test "$(probe http://socket-proxy:2375/images/json)" = "403"
+
+      - name: Security headers are present
+        run: |
+          headers=$(curl -fsSI http://127.0.0.1:8080/)
+          for h in content-security-policy x-content-type-options x-frame-options referrer-policy; do
+            echo "$headers" | grep -qi "^$h:" || { echo "::error::missing $h"; exit 1; }
+          done
+
+      - name: Write methods and traversal are refused
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/)" = "405"
+          # --path-as-is keeps curl from normalising the traversal away
+          test "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8080/../src/server.js')" = "404"
+          test "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8080/..%2f..%2fetc%2fpasswd')" = "404"
+
+      # A snapshot that stopped advancing must fail the healthcheck rather than
+      # serving a stale page behind a 200.
+      - name: Healthz turns 503 when collection wedges
+        run: |
+          docker compose stop socket-proxy
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/healthz)
+            if [ "$code" = "503" ]; then
+              echo "ok: healthz went 503 after ${i}s"
+              docker compose start socket-proxy
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::healthz stayed 200 with collection broken"
+          docker compose start socket-proxy
+          exit 1
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

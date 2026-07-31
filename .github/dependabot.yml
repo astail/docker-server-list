@@ -1,0 +1,29 @@
+version: 2
+
+# Everything in this repo is pinned by digest or commit SHA so a moved tag
+# cannot change what we run. That only stays safe if something bumps the pins,
+# which is this file's job.
+updates:
+  # FROM node@sha256:... in the Dockerfile
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
+
+  # tecnativa/docker-socket-proxy@sha256:... in compose.yaml
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build"
+
+  # SHA-pinned actions in .github/workflows
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
