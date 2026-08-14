@@ -1,7 +1,7 @@
 # Pinned by digest so a moved tag cannot swap the base image out from under a
 # rebuild. Dependabot bumps this weekly (.github/dependabot.yml), which is what
 # keeps the pin from freezing out Alpine and Node security patches.
-FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2
+FROM node:26-alpine@sha256:aadf416b2cdce311a8811ba3f0608a61b77dbf997500e2eafe781b51f6a0b019
 
 WORKDIR /app
 
